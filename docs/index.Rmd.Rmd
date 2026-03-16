@@ -1,0 +1,342 @@
+---
+title: "Analysing Seasonal Patterns in River Salmon Counts Using Meta Prophet"
+author: "Dalip Mudhar"
+date: "2026-03-07"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+<style>
+body {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 18px;
+  line-height: 1.75;
+  color: #2f2f2f;
+}
+
+.main-container {
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+h1.title {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 3em;
+  font-weight: 800;
+  line-height: 1.15;
+  margin-top: 10px;
+  margin-bottom: 20px;
+  color: #222222;
+}
+
+.author, .date {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1.15em;
+  color: #444444;
+  font-weight: 600;
+}
+
+#TOC {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 0.95em;
+  background-color: #fafafa;
+  border: 1px solid #d9d9d9;
+  border-radius: 8px;
+  padding: 12px 14px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+#TOC .toc-title {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1.05em;
+  font-weight: 700;
+  color: #222222;
+}
+
+#TOC a {
+  color: #2f2f2f;
+  text-decoration: none;
+}
+
+#TOC a:hover {
+  color: #000000;
+  text-decoration: underline;
+}
+
+#TOC .active a {
+  font-weight: 700;
+}
+
+@media (min-width: 992px) {
+  .toc-content {
+    padding-left: 40px;
+    padding-right: 20px;
+  }
+}
+
+img {
+  border-radius: 8px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+This project analyses monthly salmon counts recorded at Tees Barrage on the River Tees. I chose this topic because I wanted to use a time series with clear seasonality, and salmon migration seemed more interesting to me than a series with only a long-term trend. I also remembered seeing salmon migration in Canada and thought it was very interesting. The aim of this project is to explore the pattern in the data and then use Meta Prophet to forecast future monthly salmon counts.
+
+<p>These photos are from Canada and show part of what made salmon migration feel so interesting to me. They are included here as a personal link to why I chose this topic.</p>
+
+<div style="text-align: center;">
+  <img src="images/20240812230744_IMG_9069.JPG" alt="Salmon migration in Canada" width="35%" style="margin-right: 12px; border-radius: 6px;">
+  <img src="images/IMG_9960.JPG" alt="Bear with salmon in Canada" width="35%" style="border-radius: 6px;">
+  <p style="font-size: 0.95em;"><em>Photos from Canada. Seeing salmon migration in person, and later seeing a bear with a salmon, made the topic feel much more real and helped inspire the choice of dataset for this project.</em></p>
+</div>
+
+# Data Source and Project Aim
+
+The data used in this project comes from the Environment Agency fish counts dataset for the River Tees. The file includes daily and monthly upstream fish counts recorded at Tees Barrage. For this project, I wanted to focus on the monthly salmon counts because they give a clear time series that is easier to analyse and forecast. The main aim is to see whether the salmon counts follow a seasonal pattern through the year and whether Meta Prophet can capture that pattern and produce a useful forecast.
+
+```{r libraries}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(prophet)
+library(lubridate)
+library(plotly)
+```
+
+# Data Preparation
+
+The monthly counts sheet was not ready to use straight away, so the data needed to be cleaned first. The workbook included title rows at the top and notes at the bottom, so these had to be removed. The month columns were then changed into a long format so that each row represented one month. After that, I created a date column and a salmon count column in the format needed for Meta Prophet. The missing months before July 2011 were left out when creating the final time series because the salmon series began in July 2011.
+
+```{r data-preparation}
+monthly_counts <- read_excel(
+  "data/River_Tees_daily_and_monthly_fish_counts.xlsx",
+  sheet = "Monthly_counts",
+  skip = 2,
+  col_names = FALSE
+)
+
+names(monthly_counts)[1:14] <- c(
+  "Year", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Total"
+)
+
+monthly_counts <- filter(monthly_counts, !is.na(Year))
+monthly_counts <- filter(monthly_counts, grepl("^[0-9]{4}$", Year))
+monthly_counts <- select(monthly_counts, Year, Jan, Feb, Mar, Apr, May, Jun, Jul, Aug, Sep, Oct, Nov, Dec)
+
+monthly_salmon <- pivot_longer(
+  monthly_counts,
+  cols = Jan:Dec,
+  names_to = "Month",
+  values_to = "Count"
+)
+
+monthly_salmon$Year <- as.integer(monthly_salmon$Year)
+monthly_salmon$Count <- as.numeric(gsub("[^0-9.]", "", as.character(monthly_salmon$Count)))
+monthly_salmon$Month_Number <- match(monthly_salmon$Month, month.abb)
+monthly_salmon$ds <- ymd(paste(monthly_salmon$Year, monthly_salmon$Month_Number, "01"))
+monthly_salmon$y <- monthly_salmon$Count
+
+monthly_salmon <- arrange(monthly_salmon, ds)
+
+salmon_prophet <- select(monthly_salmon, ds, y)
+salmon_prophet <- filter(salmon_prophet, !is.na(y))
+```
+
+```{r data-check}
+head(salmon_prophet, 6)
+```
+
+# Exploratory Analysis
+
+Before fitting the Prophet model, I first looked at the data in a simple way. This helps show the time period covered, the size of the salmon counts, and whether there is any clear pattern in the series. The main thing I want to look for is seasonality, because salmon migration is expected to change through the year.
+
+```{r summary-statistics}
+summary(salmon_prophet$y)
+
+summarise(
+  salmon_prophet,
+  first_date = min(ds),
+  last_date = max(ds),
+  observations = n(),
+  minimum_count = min(y),
+  maximum_count = max(y),
+  mean_count = mean(y)
+)
+```
+
+```{r raw-salmon-plot}
+salmon_counts_plot <- ggplot(monthly_salmon, aes(x = ds, y = y)) +
+  geom_line(linewidth = 0.9, colour = "steelblue4") +
+  labs(
+    title = "Monthly salmon counts at Tees Barrage",
+    subtitle = "River Tees upstream fish counts, July 2011 onwards",
+    x = "Year",
+    y = "Monthly salmon count"
+  ) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+salmon_counts_plot
+```
+
+The plot shows a clear seasonal pattern in the salmon counts. In many months the counts are low, but in certain parts of the year they rise sharply. This suggests that salmon movement through Tees Barrage happens mainly in a particular season. The size of the peaks also changes from year to year, so the timing looks quite regular, but the size of the migration is not always the same.
+
+# Baseline Trend Model
+
+Before using Prophet, I fitted a simple linear regression model as a basic comparison. This gives a rough idea of whether the salmon counts are increasing or decreasing over time on average. However, I do not expect a straight-line model to explain the data very well. This is because the main feature of this series is seasonality rather than a simple overall trend.
+
+```{r linear-model}
+linear_model_data <- salmon_prophet
+linear_model_data$Time <- 1:nrow(linear_model_data)
+
+linear_model <- lm(y ~ Time, data = linear_model_data)
+
+summary(linear_model)
+```
+
+The linear regression suggests that salmon counts decrease by about 0.44 fish per month on average over the sample period, and this result is statistically significant because the p-value is 0.000108. However, the model explains only a small part of the variation in the data, so a straight-line trend does not describe the series very well. This is one reason why Prophet is more suitable for this project.
+
+# Prophet Model
+
+Prophet is a good model for this dataset because it is designed for time series with trend and seasonality. In this project, the data is monthly, so it makes sense to include yearly seasonality. Weekly and daily seasonality were not included because the data is not recorded at those time scales. I used Prophet to see whether it could capture the repeated seasonal pattern in the salmon counts and produce a sensible forecast for future months.
+
+```{r prophet-model}
+salmon_model <- prophet(
+  salmon_prophet,
+  yearly.seasonality = TRUE,
+  weekly.seasonality = FALSE,
+  daily.seasonality = FALSE
+)
+```
+
+# Forecast Results
+
+After fitting the Prophet model, I created future monthly dates and used the model to predict salmon counts for the months ahead. The main purpose of this section is to see whether the model keeps the strong seasonal pattern shown in the original data. I also want to see how the uncertainty changes as the forecast moves further into the future.
+
+```{r forecast-data}
+future_salmon <- make_future_dataframe(
+  salmon_model,
+  periods = 36,
+  freq = "month"
+)
+
+salmon_forecast <- predict(salmon_model, future_salmon)
+```
+
+```{r forecast-plot}
+forecast_plot_data <- select(salmon_forecast, ds, yhat, yhat_lower, yhat_upper)
+forecast_plot_data <- left_join(forecast_plot_data, salmon_prophet, by = "ds")
+
+salmon_forecast_plot <- ggplot(forecast_plot_data, aes(x = ds)) +
+  geom_ribbon(
+    aes(ymin = yhat_lower, ymax = yhat_upper),
+    fill = "lightblue",
+    alpha = 0.35
+  ) +
+  geom_line(aes(y = yhat), colour = "steelblue4", linewidth = 1) +
+  geom_point(
+    data = salmon_prophet,
+    aes(x = ds, y = y),
+    colour = "black",
+    size = 1.5
+  ) +
+  labs(
+    title = "Forecast of monthly salmon counts at Tees Barrage",
+    subtitle = "Observed counts are shown in black, the forecast in blue, and uncertainty as a shaded band",
+    x = "Year",
+    y = "Monthly salmon count"
+  ) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+salmon_forecast_plot
+```
+
+The forecast keeps the clear seasonal pattern in the salmon counts, with repeated peaks appearing at similar times each year. This suggests that the model has captured the main seasonal structure of the series. The shaded band becomes wider further into the future, which shows that the forecast becomes less certain over time. The model seems better at predicting the timing of the peaks than the size of the very largest spikes.
+
+# Seasonal Interpretation
+
+One of the main reasons for choosing this dataset was that the salmon counts seemed likely to have clear seasonality. After fitting the Prophet model, I looked at the seasonal component to see how the pattern changes across the months of the year. This helps show which months are linked to higher salmon counts and which months are linked to lower counts.
+
+```{r seasonal-plot}
+yearly_monthly_pattern <- mutate(
+  salmon_forecast,
+  Month_Label = month(ds, label = TRUE, abbr = TRUE)
+)
+
+yearly_monthly_pattern <- group_by(yearly_monthly_pattern, Month_Label)
+
+yearly_monthly_pattern <- summarise(
+  yearly_monthly_pattern,
+  mean_yearly_effect = mean(yearly, na.rm = TRUE)
+)
+
+yearly_monthly_pattern$Month_Label <- factor(
+  yearly_monthly_pattern$Month_Label,
+  levels = month.abb
+)
+
+monthly_seasonality_plot <- ggplot(
+  yearly_monthly_pattern,
+  aes(x = Month_Label, y = mean_yearly_effect, group = 1)
+) +
+  geom_line(colour = "darkgreen", linewidth = 1) +
+  geom_point(colour = "darkgreen", size = 2) +
+  labs(
+    title = "Average monthly seasonal pattern in salmon counts",
+    subtitle = "Estimated yearly seasonal effect from the Prophet model",
+    x = "Month",
+    y = "Seasonal effect"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+monthly_seasonality_plot
+```
+
+The seasonal plot shows a clear pattern through the year. The seasonal effect is lowest in winter and early spring, then starts to rise through late spring and early summer. It reaches its highest level in July and August before falling again afterwards. This matches the idea that salmon movement through Tees Barrage is strongest in a particular part of the year rather than being spread evenly across all months.
+
+# Conclusion
+
+This project showed that monthly salmon counts at Tees Barrage follow a clear seasonal pattern. After cleaning the data and converting it into the format needed for Prophet, I explored the series using summary statistics, plots, and a simple linear model. The Prophet model captured the repeating seasonal pattern well and produced a forecast that continued this yearly cycle into future months. Overall, this project shows that salmon counts are a good example of a seasonal time series and that Prophet can be used to model and forecast this type of data in a clear and useful way.
+
+# Interactive Visualisation
+
+As an extra feature, I created an interactive version of the monthly salmon counts plot using Plotly. This makes it easier to inspect individual peaks and compare values across time.
+
+```{r interactive-forecast}
+ggplotly(salmon_forecast_plot)
+```
